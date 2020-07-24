@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -11,6 +12,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"fyne.io/fyne"
+	"fyne.io/fyne/app"
+	"fyne.io/fyne/dialog"
+	"fyne.io/fyne/widget"
 )
 
 /*
@@ -25,8 +31,9 @@ import (
 */
 
 var (
-	_jar    = &cookiejar.Jar{}
-	_videos = map[string]bool{}
+	_jar               = &cookiejar.Jar{}
+	_client            = http.DefaultClient
+	_proxyURL *url.URL = nil
 )
 
 func init() {
@@ -35,7 +42,11 @@ func init() {
 		panic(err)
 	}
 	_jar = jar
-	fill("list.txt", _videos)
+
+	_client = &http.Client{
+		Jar:       _jar,
+		Transport: &http.Transport{},
+	}
 }
 
 func fill(path string, m map[string]bool) {
@@ -55,7 +66,7 @@ func fill(path string, m map[string]bool) {
 
 func download(c *http.Client, name, url string) error {
 	fp := filepath.Base(name)
-	fmt.Println(fp) // This one is getting downloaded
+	fmt.Println("Downloading ", fp) // This one is getting downloaded
 	f := fp + ".mp4"
 	if _, err := os.Stat(f); err == nil {
 		return nil
@@ -78,57 +89,106 @@ func download(c *http.Client, name, url string) error {
 	return err
 }
 
-func process(c *http.Client, url string) {
-	fp := filepath.Base(url)
+func processWithProxy(p *dialog.ProgressDialog, text, proxy string) error {
+	proxy = strings.TrimSpace(proxy)
+	if proxy == "" {
+		_client.Transport = &http.Transport{}
+		_proxyURL = nil
+	} else {
+		proxyURL, err := url.Parse(proxy)
+		if err != nil {
+			return err
+		}
+		_client.Transport = &http.Transport{Proxy: http.ProxyURL(proxyURL)}
+		_proxyURL = proxyURL
+	}
+
+	text = strings.TrimSpace(text)
+	videoURLs := strings.Split(text, "\n")
+
+	var _finalErr error
+	n := len(videoURLs)
+	for i, url := range videoURLs {
+		p.SetValue(float64(i) / float64(n))
+		if err := process(url); err != nil {
+			_finalErr = err
+		}
+	}
+	p.SetValue(1.0)
+
+	return _finalErr
+}
+
+func process(videoURL string) error {
+	var _err error
+	fp := filepath.Base(videoURL)
 	f := fp + ".mp4"
 	if _, err := os.Stat(f); err == nil {
-		return
+		return errors.New("File already exists")
 	}
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	req, err := http.NewRequest(http.MethodGet, videoURL, nil)
 	if err != nil {
 		panic(err)
 	}
 
 	req.Header.Set("user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.97 Safari/537.36")
 
-	resp, err := c.Do(req)
+	resp, err := _client.Do(req)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	b, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		panic(err)
+		return err
 	}
-	// if err := ioutil.WriteFile("z.html", b, 0777); err != nil {
-	// 	panic(err)
-	// }
+
 	a := strings.Split(string(b), "\"],\"videoMeta\":")[0]
-	defer func() {
-		if r := recover(); r != nil {
-			fmt.Println(url)
-		}
-	}()
-	a = strings.Split(a, "\"urls\":")[1][2:]
-	if err = download(c, url, a); err != nil {
-		panic(err)
+	splitted := strings.Split(a, "\"urls\":")
+	if len(splitted) < 2 {
+		return errors.New("Unable to fetch content for video URL")
 	}
+	a = splitted[1][2:]
+	if err = download(_client, videoURL, a); err != nil {
+		return err
+	}
+
+	return _err
 }
 
 func main() {
-	// proxy := "http://52.179.18.244:8080"
-	proxy := "http://137.220.34.109:8080"
-	proxyURL, err := url.Parse(proxy)
-	if err != nil {
-		panic(err)
-	}
-	c := &http.Client{
-		Jar: _jar,
-		Transport: &http.Transport{
-			Proxy: http.ProxyURL(proxyURL),
-		},
-	}
-	for i := range _videos {
-		process(c, i)
-		break
-	}
+	app := app.New()
+
+	w := app.NewWindow("Download From Tiktok")
+
+	url := widget.NewMultiLineEntry()
+	url.PlaceHolder = "Enter URL(s)"
+
+	proxy := widget.NewEntry()
+	proxy.PlaceHolder = "HTTPS proxy"
+
+	submitButton := widget.NewButton("Submit", func() {
+		progress := dialog.NewProgress("Downloading", "Downloading", w)
+		if err := processWithProxy(progress, url.Text, proxy.Text); err != nil {
+			progress.Hide()
+			dialog.NewError(err, w).Show()
+		} else {
+			progress.Hide()
+		}
+
+	})
+
+	submitButton.Alignment = widget.ButtonAlignCenter
+
+	screenContent := widget.NewVBox(
+		url,
+		proxy,
+		submitButton,
+	)
+	w.SetContent(
+		screenContent,
+	)
+	w.Resize(fyne.NewSize(600, 400))
+	w.CenterOnScreen()
+
+	w.ShowAndRun()
 }
